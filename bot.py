@@ -45,7 +45,7 @@ def persian_to_num(text):
 # ================= NETWORK =================
 async def telegram_request(method, url, **kwargs):
     # REMEMBER: Set to None on VPS
-    PROXIES = {"http": "http://127.0.0.1:10809", "https": "http://127.0.0.1:10809"}
+    PROXIES = None
     def _do():
         resp = requests.request(method, url, timeout=15, proxies=PROXIES, **kwargs)
         resp.raise_for_status()
