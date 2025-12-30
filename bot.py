@@ -3,26 +3,23 @@ import requests
 import datetime
 import json
 import os
-from playwright.async_api import async_playwright
 
 # ================= CONFIG =================
 BOT_TOKEN = "8412812041:AAHZmfUMBstBsJdkVs6GAc01QfqFJb51KMg"
 ADMIN_IDS = [52699743, 65336142] 
-HTTP_PROXY = "http://127.0.0.1:10809"
 SETTINGS_FILE = "settings.json"
 
-PROXIES = {"http": HTTP_PROXY, "https": HTTP_PROXY}
-CHECK_URL = "https://charisma.ir/plans/silver"
+# The Direct API URL you discovered
+API_URL = "https://webapi.charisma.ir/api/Plan/plan-calculator-info-by-id?planId=04689a46-3eff-45d4-a070-f83f7d4d20d8"
 
 # Global Variables
 buy_price = None
 sell_price = None
-last_update_id = None
 last_notified_price = None
 last_update_time = None
 user_states = {}
-# ==========================================
 
+# ================= UTILS =================
 def save_settings():
     data = {"buy_price": buy_price, "sell_price": sell_price}
     with open(SETTINGS_FILE, "w") as f:
@@ -36,173 +33,135 @@ def load_settings():
                 data = json.load(f)
                 buy_price = data.get("buy_price")
                 sell_price = data.get("sell_price")
-                print(f"✅ Settings loaded: Buy={buy_price}, Sell={sell_price}")
         except: pass
 
 def persian_to_int(text):
     persian_digits = "۰۱۲۳۴۵۶۷۸۹"
     english_digits = "0123456789"
     translation = str.maketrans(persian_digits, english_digits)
-    cleaned = text.translate(translation).replace("٬", "").replace(",", "").strip()
-    return int(cleaned)
+    cleaned = str(text).translate(translation).replace("٬", "").replace(",", "").strip()
+    return int(float(cleaned))
 
-# --- Smart Connection Logic (Race) ---
-async def telegram_request_race(method, url, **kwargs):
-    def _do_request(use_proxy):
-        p = PROXIES if use_proxy else None
-        resp = requests.request(method, url, timeout=(5, 12), proxies=p, **kwargs)
+# ================= NETWORK =================
+async def telegram_request(method, url, **kwargs):
+    # Set this to None when deploying to your VPS
+    PROXIES = {"http": "http://127.0.0.1:10809", "https": "http://127.0.0.1:10809"}
+    
+    def _do():
+        resp = requests.request(method, url, timeout=15, proxies=PROXIES, **kwargs)
         resp.raise_for_status()
         return resp
+    return await asyncio.to_thread(_do)
 
-    tasks = [
-        asyncio.create_task(asyncio.to_thread(_do_request, False)),
-        asyncio.create_task(asyncio.to_thread(_do_request, True))
-    ]
+# ================= SCRAPER =================
+class SilverPriceScraper:
+    def __init__(self, api_url):
+        self.api_url = api_url
+        self.headers = {"User-Agent": "Mozilla/5.0"}
 
-    while tasks:
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            try:
-                result = task.result()
-                for p in pending: p.cancel()
-                return result
-            except:
-                tasks.remove(task)
-        tasks = list(pending)
-    raise ConnectionError("Both attempts failed")
+    async def start(self):
+        print("🚀 Scraper active: Direct API Mode (Playwright Removed)")
 
-# --- Telegram functions ---
+    async def get_price(self):
+        def _fetch():
+            # Add timestamp to bypass any server-side caching
+            ts_url = f"{self.api_url}&_t={datetime.datetime.now().timestamp()}"
+            resp = requests.get(ts_url, headers=self.headers, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            return data['lastPrice']
+
+        raw_price = await asyncio.to_thread(_fetch)
+        return int(float(raw_price))
+
+    async def close(self): pass
+
+# ================= ACTIONS =================
 async def send_message(chat_id, text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    try:
-        await telegram_request_race("POST", url, data={"chat_id": chat_id, "text": text})
+    try: await telegram_request("POST", url, data={"chat_id": chat_id, "text": text})
     except: pass
 
 async def broadcast_message(text):
-    await asyncio.gather(*[send_message(admin_id, text) for admin_id in ADMIN_IDS])
+    await asyncio.gather(*[send_message(aid, text) for aid in ADMIN_IDS])
 
-async def get_updates(offset=None):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    params = {"timeout": 10}
-    if offset: params["offset"] = offset
-    resp = await telegram_request_race("GET", url, params=params)
-    return resp.json()["result"]
-
-# --- Scraper ---
-class SilverPriceScraper:
-    def __init__(self, url):
-        self.url = url
-        self.page, self.browser, self.playwright = None, None, None
-
-    async def start(self):
-        await self.close()
-        self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(headless=True)
-        self.context = await self.browser.new_context()
-        self.page = await self.context.new_page()
-        await self.page.route("**/*", lambda r: r.abort() if r.request.resource_type in ["image", "media", "font"] else r.continue_())
-
-    async def get_price(self):
-        await self.page.goto(self.url, wait_until="domcontentloaded", timeout=30000)
-        selector = "span.text-x-h2"
-        await self.page.wait_for_function("(sel) => { const el = document.querySelector(sel); return el && /[۰-۹]/.test(el.innerText); }", arg=selector, timeout=20000)
-        text = await self.page.evaluate(f"document.querySelector('{selector}').innerText")
-        for t in text.split():
-            if any(ch in t for ch in "۰۱۲۳۴۵۶۷۸۹"): return persian_to_int(t)
-        raise ValueError("No price")
-
-    async def close(self):
-        try:
-            if self.browser: await self.browser.close()
-            if self.playwright: await self.playwright.stop()
-        except: pass
-
-# --- Monitor ---
 async def monitor_price(scraper):
     global last_notified_price, last_update_time
-    errs = 0
     while True:
         try:
             current_price = await scraper.get_price()
-            errs = 0
             last_update_time = datetime.datetime.now()
-            print(f"[{last_update_time.strftime('%H:%M:%S')}] Scraped: {current_price}")
+            print(f"[{last_update_time.strftime('%H:%M:%S')}] Price: {current_price:,}")
             
             if current_price != last_notified_price:
-                last_notified_price = current_price
                 if buy_price and current_price <= buy_price:
-                    await broadcast_message(f"🟢 سیگنال خرید\nقیمت فعلی ({current_price:,}) به کمتر از حد خرید ({buy_price:,}) رسید.")
+                    await broadcast_message(f"🟢 سیگنال خرید\nقیمت: {current_price:,}")
                 if sell_price and current_price >= sell_price:
-                    await broadcast_message(f"🔴 سیگنال فروش\nقیمت فعلی ({current_price:,}) به بیشتر از حد فروش ({sell_price:,}) رسید.")
-            await asyncio.sleep(30)
+                    await broadcast_message(f"🔴 سیگنال فروش\nقیمت: {current_price:,}")
+                last_notified_price = current_price
+            await asyncio.sleep(60)
         except Exception as e:
-            errs += 1
-            if errs >= 2: await scraper.start(); errs = 0
-            await asyncio.sleep(5)
+            print(f"Monitor Error: {e}")
+            await asyncio.sleep(10)
 
-# --- Processor ---
-async def process_messages(messages):
-    global buy_price, sell_price, last_update_id, user_states, last_notified_price, last_update_time
-    for msg in messages:
-        last_update_id = msg["update_id"] + 1
-        message = msg.get("message") or msg.get("edited_message")
-        if not message or "text" not in message: continue
-        chat_id = message["from"]["id"]
+# ================= MESSAGE PROCESSOR =================
+async def process_updates(updates):
+    global buy_price, sell_price, user_states
+    for update in updates:
+        msg = update.get("message")
+        if not msg or "text" not in msg: continue
+        chat_id = msg["from"]["id"]
         if chat_id not in ADMIN_IDS: continue
-        text = message["text"].strip()
+        
+        text = msg["text"].strip()
         state = user_states.get(chat_id)
 
         if text == "/start":
-            await send_message(chat_id, "🤖 ربات پایش قیمت نقره فعال شد.\n\n/price | /buy | /sell | /status")
-        
+            await send_message(chat_id, "🤖 ربات نقره فعال شد.\n/price | /buy | /sell | /status")
         elif text == "/price":
-            if last_notified_price:
-                time_str = last_update_time.strftime("%H:%M:%S")
-                await send_message(chat_id, f"💰 آخرین قیمت: {last_notified_price:,}\n🕒 زمان بروزرسانی: {time_str}")
-            else:
-                await send_message(chat_id, "⏳ در حال دریافت قیمت از سایت...")
-
+            p = f"{last_notified_price:,}" if last_notified_price else "در حال دریافت..."
+            await send_message(chat_id, f"💰 قیمت فعلی: {p}")
         elif text == "/status":
-            bp = f"{buy_price:,}" if buy_price else "تنظیم نشده"
-            sp = f"{sell_price:,}" if sell_price else "تنظیم نشده"
-            lp = f"{last_notified_price:,}" if last_notified_price else "در حال دریافت..."
-            lt = last_update_time.strftime("%H:%M:%S") if last_update_time else "نامشخص"
-            await send_message(chat_id, f"📊 وضعیت فعلی:\n\n📥 حد خرید: {bp}\n📤 حد فروش: {sp}\n🏷 آخرین قیمت: {lp}\n🕒 زمان بروزرسانی: {lt}")
-
+            res = f"📊 وضعیت:\nخرید: {buy_price or 0:,}\nفروش: {sell_price or 0:,}\nقیمت: {last_notified_price or 0:,}"
+            await send_message(chat_id, res)
         elif text == "/buy":
-            user_states[chat_id] = "W_BUY"
-            await send_message(chat_id, "📉 لطفا قیمت خرید مورد نظر را وارد کنید:")
-        
+            user_states[chat_id] = "SET_BUY"
+            await send_message(chat_id, "📉 قیمت خرید:")
         elif text == "/sell":
-            user_states[chat_id] = "W_SELL"
-            await send_message(chat_id, "📈 لطفا قیمت فروش مورد نظر را وارد کنید:")
-
-        elif state == "W_BUY":
+            user_states[chat_id] = "SET_SELL"
+            await send_message(chat_id, "📈 قیمت فروش:")
+        elif state == "SET_BUY":
             try:
                 buy_price = persian_to_int(text); save_settings()
-                await send_message(chat_id, f"✅ قیمت خرید روی {buy_price:,} تنظیم و ذخیره شد.")
+                await send_message(chat_id, f"✅ حد خرید: {buy_price:,}")
                 user_states[chat_id] = None
-            except: await send_message(chat_id, "❌ خطا: عدد معتبر وارد کنید.")
-
-        elif state == "W_SELL":
+            except: await send_message(chat_id, "❌ خطا در عدد.")
+        elif state == "SET_SELL":
             try:
                 sell_price = persian_to_int(text); save_settings()
-                await send_message(chat_id, f"✅ قیمت فروش روی {sell_price:,} تنظیم و ذخیره شد.")
+                await send_message(chat_id, f"✅ حد فروش: {sell_price:,}")
                 user_states[chat_id] = None
-            except: await send_message(chat_id, "❌ خطا: عدد معتبر وارد کنید.")
+            except: await send_message(chat_id, "❌ خطا در عدد.")
 
+# ================= MAIN =================
 async def main():
-    global last_update_id
     load_settings()
-    scraper = SilverPriceScraper(CHECK_URL)
+    scraper = SilverPriceScraper(API_URL)
     await scraper.start()
     asyncio.create_task(monitor_price(scraper))
+    
+    print("✅ Bot is running...")
+    offset = None
     while True:
         try:
-            updates = await get_updates(last_update_id)
-            if updates: await process_messages(updates)
-        except: await asyncio.sleep(2)
-        await asyncio.sleep(0.1)
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+            resp = await telegram_request("GET", url, params={"timeout": 10, "offset": offset})
+            updates = resp.json()["result"]
+            if updates:
+                await process_updates(updates)
+                offset = updates[-1]["update_id"] + 1
+        except: await asyncio.sleep(5)
+        await asyncio.sleep(0.5)
 
 if __name__ == "__main__":
     asyncio.run(main())
